@@ -10,6 +10,20 @@ import pytesseract
 import re
 from fastapi import File, UploadFile
 from PIL import Image
+import os
+import json
+import google.generativeai as genai  # المكتبة الجديدة للـ Agent
+from pydantic import BaseModel
+
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GENAI_API_KEY)
+
+# الـ Schema اللي بتجبر الـ Agent يطلع البيانات مظبوطة
+class ExtractedCBC(BaseModel):
+    hgb: float = None
+    mcv: float = None
+    mch: float = None
+    rbc: float = None
 
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -76,106 +90,79 @@ async def predict_file(file: UploadFile = File(...)):
         results.append({"patient": row.get('Name', 'Unknown'), "result": res})
     return results
 
-# 3. (OCR)
-@app.post("/predict/image")
-async def predict_from_image(file: UploadFile = File(...)):
-    try:
-        # 1. قراءة محتوى الملف المرفوع
-        contents = await file.read()
-        
-        
-        
-        # تحويل البايتات لصور يفهمها OpenCV
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        # تحويل لرمادي وتكبير الصورة لتحسين الدقة
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
-        # --- 3. نبعت الصورة "المعالجـة" لـ Tesseract ---
-
-        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-        raw_text = pytesseract.image_to_string(thresh, config=custom_config)
-        
-        # --- من أول هنا ابدأ الاستبدال ---
-        
-       # 1. عرف الدالة الأول (تأكد إنها بتبدأ من أول السطر جوه الدالة الكبيرة)
-       # 1. دالة الاستخراج (زي ما هي مع تحسين بسيط)
-        def extract_value(short_name, text):
-            patterns = {
-                "HGB": r"H[GgB60b]{2}.*?(\d+\.?\d*)",
-                "MCV": r"MC[Vv0uU7].*?(\d+\.?\d*)",
-                "MCH": r"MCH.*?(\d+\.?\d*)",
-                "RBC": r"RBC.*?(\d+\.?\d*)"
-            }
-            match = re.search(patterns[short_name], text, re.IGNORECASE | re.DOTALL)
-            return float(match.group(1)) if match else None
-
-        # 2. فلتر التصحيح الذكي (عشان لو الـ OCR نسي العلامة العشرية)
-        def fix_decimal(value, test_type):
-            if value is None: return None
-            # الهيموجلوبين (HGB) والـ MCH والـ RBC غالباً بيكونو رقم وجنبه منزلة عشرية واحدة
-            if test_type == "HGB" and value > 25: return value / 10  # لو قرأ 134 يخليها 13.4
-            if test_type == "RBC" and value > 10: return value / 10   # لو قرأ 46 يخليها 4.6
-            if test_type == "MCH" and value > 60: return value / 10   # لو قرأ 267 يخليها 26.7
-            return value
-
-       # 1. سحب القيم وتمريرها على الفلتر فوراً (عشان نصلح العلامة العشرية)
-        hgb = fix_decimal(extract_value("HGB", raw_text), "HGB")
-        mcv = extract_value("MCV", raw_text) 
-        mch = fix_decimal(extract_value("MCH", raw_text), "MCH")
-        rbc = fix_decimal(extract_value("RBC", raw_text), "RBC")
-
-        # 2. خطة طوارئ للهيموجلوبين (لو لسه null يدور بكلمة Hemoglobin كاملة)
-        if hgb is None:
-            hgb_alt = re.search(r"Hemoglobin.*?(\d+\.?\d*)", raw_text, re.IGNORECASE | re.DOTALL)
-            if hgb_alt:
-                hgb = fix_decimal(float(hgb_alt.group(1)), "HGB")
-
-        # 3. خطة طوارئ للـ MCV (لو لسه null يدور على رقم منطقي في النص)
-        if mcv is None:
-            potential_numbers = re.findall(r"(\d{2,3}\.\d?)", raw_text)
-            mcv = next((float(n) for n in potential_numbers if 50 <= float(n) <= 115), None)
-
-        # 1. التأكد من وجود الأرقام الأساسية
-        if all(v is not None for v in [hgb, mcv, mch, rbc]):
-            
-            # 2. حساب المعادلات اللي الموديل مستنيها (مهم جداً!)
-            mentzer_index = mcv / rbc if rbc != 0 else 0
-            shine_lal = (mcv * mcv * mch) / 100
-            
-            # 3. ترتيب الـ Features "بالظبط" زي ما الموديل اتدرب في الـ Notebook
-            # الترتيب: [MCV, MCH, HGB, RBC, Mentzer, Shine]
-            features = np.array([[mcv, mch, hgb, rbc, mentzer_index, shine_lal]])
-            
-            # 4. التوقع
-            prediction_numeric = model.predict(features)[0]
-            diagnosis_name = label_encoder.inverse_transform([prediction_numeric])[0]
-
-            return {
-                "status": "success",
-                "diagnosis": diagnosis_name,
-                "extracted_values": {
-                    "HGB": hgb, "MCV": mcv, "MCH": mch, "RBC": rbc,
-                    "Mentzer_Index": round(mentzer_index, 2),
-                    "Shine_Lal": round(shine_lal, 2)
-                }
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Values missing. Please check the terminal for raw text.",
-                "detected": {"HGB": hgb, "MCV": mcv, "MCH": mch, "RBC": rbc},
-                "raw_debug": raw_text[:500] # هيظهرلك أول 500 حرف من اللي قراهم عشان تفهم التايه فين
-            }
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+@app.post("/predict/image")  # سبنا نفس الاسم عشان الفرونت إند يفضل شغال تمام
+async def predict_with_agent(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Please upload a valid lab report image.")
     
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000) # لازم يكون فيه مسافة (Tab) هنا
+    try:
+        # قراءة الصورة كـ Bytes وباصيتها للـ Agent
+        image_bytes = await file.read()
+        
+        ai_model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = """
+        You are an expert medical data extraction agent. 
+        Analyze this CBC lab report image and extract exactly these 4 features:
+        - HGB (Hemoglobin)
+        - MCV (Mean Corpuscular Volume)
+        - MCH (Mean Corpuscular Hemoglobin)
+        - RBC (Red Blood Cell Count)
+        
+        CRITICAL RULES:
+        1. Extract the values as float numbers.
+        2. If a value is missing or unreadable, set it to null.
+        3. Respond ONLY with a valid JSON object matching the requested schema. No conversational text, no markdown block wrappers.
+        """
+        
+        response = ai_model.generate_content(
+            contents=[
+                {"mime_type": file.content_type, "data": image_bytes},
+                prompt
+            ],
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        extracted_data = json.loads(response.text)
+        
+        hgb = extracted_data.get("hgb")
+        mcv = extracted_data.get("mcv")
+        mch = extracted_data.get("mch")
+        rbc = extracted_data.get("rbc")
+        
+        # لو الـ Agent معرفش يلقط الـ 4 قيم كاملين بيرد بـ partial عشان الـ Front يحس بيه
+        if None in [hgb, mcv, mch, rbc]:
+            return {
+                "status": "partial",
+                "message": "The AI Agent could not confidently extract all critical values. Please review or use manual entry.",
+                "detected": extracted_data
+            }
+            
+        # الحسابات التلقائية للمؤشرات (الـ Feature Engineering بتاعك)
+        mentzer_index = mcv / rbc
+        shine_lal = (mcv ** 2 * mch) / 100
+        
+        # ترتيب الـ Features بالظبط زي ما الموديل الخبير متعود
+        features = [[mcv, mch, hgb, rbc, mentzer_index, shine_lal]]
+        
+        # التوقع بالموديل الخبير الجديد بتاعك
+        prediction_encoded = model.predict(features)[0]
+        
+        return {
+            "status": "success",
+            "agent_extraction": "Advanced Vision AI Agent",
+            "diagnosis": str(prediction_encoded),  # هيرجع التشخيص فوراً
+            "extracted_values": {
+                "HGB": hgb, "MCV": mcv, "MCH": mch, "RBC": rbc
+            },
+            "indicators": {
+                "mentzer_index": round(mentzer_index, 2),
+                "shine_lal": round(shine_lal, 2)
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
 
 
    
