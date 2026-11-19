@@ -4,7 +4,6 @@ import json
 import joblib
 from dotenv import load_dotenv
 
-# 1. تفعيل load_dotenv في أول الفايل خالص عشان يقرا المفتاح صح
 load_dotenv()
 
 import numpy as np
@@ -14,7 +13,6 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
-# استدعاء الـ SDK الجديد والمستقر بالكامل
 from google import genai
 from google.genai import types
 
@@ -25,12 +23,11 @@ VERSION = "3.1.0"
 MCV_NORMAL_THRESHOLD = float(os.getenv("MCV_NORMAL_THRESHOLD", "81.0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 2. تعريف الـ Client بالطريقة الجديدة الصح
 client = None
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    print("⚠️ Warning: GEMINI_API_KEY is not set in environment!")
+    print(" Warning: GEMINI_API_KEY is not set in environment!")
 
 # ─────────────────────────────────────────
 # Load ML Model
@@ -41,9 +38,9 @@ label_encoder = None
 try:
     model = joblib.load("thalassemia_expert_model.pkl")
     label_encoder = joblib.load("label_encoder.pkl")
-    print("✅ Model loaded successfully.")
+    print(" Model loaded successfully.")
 except Exception as e:
-    print(f"❌ Model load error: {e}")
+    print(f" Model load error: {e}")
 
 # ─────────────────────────────────────────
 # Score & Recommendation Maps
@@ -248,14 +245,13 @@ async def predict_image(file: UploadFile = File(...)):
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=415, detail="Please upload a valid lab report image.")
 
-    # تعديل التحقق ليتماشى مع الـ Client الجديد
     if client is None:
         raise HTTPException(status_code=503, detail="AI image extraction is not configured. Use manual entry.")
 
     image_bytes = await file.read()
 
     try:
-        # تحويل الصورة لتتوافق مع الـ SDK الجديد باستخدام PIL
+        
         image = Image.open(io.BytesIO(image_bytes))
 
         prompt = """
@@ -272,7 +268,7 @@ async def predict_image(file: UploadFile = File(...)):
         3. No markdown, no explanation, just raw JSON.
         """
 
-        # استخدام الـ SDK المطور (gemini-2.5-flash هو الأحدث والأسرع)
+        
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[image, prompt],
